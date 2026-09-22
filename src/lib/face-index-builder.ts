@@ -45,6 +45,12 @@ export type BuildState = {
   total: number;
   facesIndexed: number;
   peopleIndexed: number;
+  /** Unique photos read successfully so far. Counts only, never ids. */
+  indexedAssets: number;
+  /** Unique photos that could not be read. */
+  failedAssets: number;
+  /** True once a result is applied with photos missing: not a clean build. */
+  partial: boolean;
   startedAt: string | null;
   finishedAt: string | null;
   error: string | null;
@@ -56,6 +62,9 @@ const idleState: BuildState = {
   total: 0,
   facesIndexed: 0,
   peopleIndexed: 0,
+  indexedAssets: 0,
+  failedAssets: 0,
+  partial: false,
   startedAt: null,
   finishedAt: null,
   error: null,
@@ -148,8 +157,12 @@ async function embeddingsForAsset(
 /** Raised when a finished build should NOT replace the working index. */
 class BuildRefused extends Error {}
 
-/** The most photos that may fail before the result is not trusted. */
-const MAX_FAILED_FRACTION = 0.2;
+/**
+ * At or above this share of failures the run looks like an outage rather than
+ * a few bad photos, so the result is not trusted at all. Below it, the photos
+ * that did work are real results and worth serving.
+ */
+const OUTAGE_FAILED_FRACTION = 0.6;
 
 /** A rebuild that finds less than this share of the current index is suspect. */
 const MIN_SHARE_OF_PREVIOUS = 0.5;
@@ -159,39 +172,53 @@ const MIN_SHARE_OF_PREVIOUS = 0.5;
  * itself first. Photos that fail are skipped, which is right for one bad file
  * and disastrous when Immich or the ML service is down: every photo "fails",
  * the build "succeeds" with nothing in it, and the good index is overwritten.
- * So: never apply an empty result, a mostly-failed one, or one that is far
- * smaller than the index it would replace. The previous index stays in use.
+ *
+ * Failing some photos is not the same as failing at the job, though. Refusing
+ * the whole result over a minority of unreadable photos left recognition with
+ * no index at all, which is strictly worse for the visitor than an index that
+ * is missing some photos. So a run is refused only when it is empty, when it
+ * looks like an outage, or when it is far smaller than the index it would
+ * replace; otherwise it is applied and reported as partial.
+ *
+ * Returns whether the accepted result is incomplete.
  */
-async function refuseUnsafeReplacement(
+async function vetReplacement(
   faces: IndexedFace[],
   failed: number,
   attempted: number
-) {
+): Promise<{ partial: boolean }> {
   if (faces.length === 0) {
     throw new BuildRefused(
       "The rebuild found no faces, so the current index was kept. Check that Immich and the face recognition service are running."
     );
   }
 
-  if (failed > Math.max(3, attempted * MAX_FAILED_FRACTION)) {
+  // max(3, ...) keeps a handful of bad photos in a tiny library from reading
+  // as an outage.
+  if (failed > Math.max(3, attempted * OUTAGE_FAILED_FRACTION)) {
     throw new BuildRefused(
       `${failed} of ${attempted} photos could not be processed, so the current index was kept. Check that Immich and the face recognition service are running, then rebuild.`
     );
   }
 
   const previous = await loadIndex();
-  if (!previous) return;
-
-  const previousPeople = new Set(previous.faces.map((f) => f.personId)).size;
-  const people = new Set(faces.map((f) => f.personId)).size;
-  if (
-    faces.length < previous.faces.length * MIN_SHARE_OF_PREVIOUS ||
-    people < previousPeople * MIN_SHARE_OF_PREVIOUS
-  ) {
-    throw new BuildRefused(
-      "The new index is much smaller than the current one, so it was not applied. Check Immich, then rebuild."
-    );
+  if (previous) {
+    const previousPeople = new Set(previous.faces.map((f) => f.personId)).size;
+    const people = new Set(faces.map((f) => f.personId)).size;
+    if (
+      faces.length < previous.faces.length * MIN_SHARE_OF_PREVIOUS ||
+      people < previousPeople * MIN_SHARE_OF_PREVIOUS
+    ) {
+      throw new BuildRefused(
+        "The new index is much smaller than the current one, so it was not applied. Check Immich, then rebuild."
+      );
+    }
   }
+
+  // With no previous index there is nothing to protect: a first index that
+  // holds real faces and does not look like an outage is worth serving, even
+  // incomplete, because the alternative is no recognition at all.
+  return { partial: failed > 0 };
 }
 
 /** What the admin sees when a build fails: never a raw error. */
@@ -224,18 +251,20 @@ async function run() {
       processed: 0,
     };
 
-    const seen = new Set<string>();
-    let failed = 0;
+    // Ids, so a photo sampled by several people counts once and so the two
+    // outcomes stay distinguishable for the index file.
+    const indexed = new Set<string>();
+    const failed = new Set<string>();
     for (const assetId of jobs) {
       // Two people can sample the same group photo; process it once.
-      if (!seen.has(assetId)) {
-        seen.add(assetId);
+      if (!indexed.has(assetId) && !failed.has(assetId)) {
         try {
           faces.push(...(await embeddingsForAsset(assetId, eligible)));
+          indexed.add(assetId);
         } catch (error) {
           // One unreadable asset should not abandon a multi-minute build, but
           // it is counted: a build where everything failed must not be applied.
-          failed++;
+          failed.add(assetId);
           describeError(error); // logged once per distinct cause, not per photo
         }
       }
@@ -245,15 +274,22 @@ async function run() {
         processed: state.processed + 1,
         facesIndexed: faces.length,
         peopleIndexed: new Set(faces.map((f) => f.personId)).size,
+        indexedAssets: indexed.size,
+        failedAssets: failed.size,
       };
     }
 
-    await refuseUnsafeReplacement(faces, failed, seen.size);
-    await saveIndex(faces);
+    const attempted = indexed.size + failed.size;
+    const { partial } = await vetReplacement(faces, failed.size, attempted);
+    await saveIndex(faces, {
+      indexedAssetIds: [...indexed],
+      failedAssetIds: [...failed],
+    });
 
     state = {
       ...state,
       status: "complete",
+      partial,
       finishedAt: new Date().toISOString(),
     };
   } catch (error) {

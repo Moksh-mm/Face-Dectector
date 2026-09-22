@@ -202,6 +202,19 @@ export default function AdminPage() {
         <Stat label="Model" value={index?.model ?? "—"} />
       </section>
 
+      {index?.partial && (
+        <p className="mt-6 flex items-start gap-3 rounded-2xl bg-amber-500/10 p-4 text-sm ring-1 ring-amber-500/30">
+          <AlertIcon className="mt-0.5 size-5 shrink-0 text-amber-600 dark:text-amber-400" />
+          <span>
+            This index is partial: {index.failedAssets} of{" "}
+            {index.indexedAssets + (index.failedAssets ?? 0)} sampled photos
+            could not be read, so some people may be missing. Recognition works
+            with the {index.indexedAssets} photos that were indexed. Rebuild once
+            Immich and the machine-learning service are healthy.
+          </span>
+        </p>
+      )}
+
       {building && (
         <section className="mt-8 space-y-3" aria-live="polite">
           <p className="text-sm font-medium">Building face index...</p>
